@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Jungle Pop &amp; Move</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #0b3d2e;
+    font-family: "Arial Rounded MT Bold", "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; touch-action: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* The camera <video> must stay "visible" to the browser to keep playing, but we draw it on the canvas ourselves. */
+  video { position: fixed; width: 2px; height: 2px; opacity: 0; pointer-events: none; left: 0; top: 0; }
+
+  /* Parent set-up screen (shown once, before the game starts) */
+  #gate {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 30%, #2fa764 0%, #14683f 55%, #0b3d2e 100%);
+    padding: 16px; box-sizing: border-box; z-index: 10; overflow-y: auto;
+  }
+  .card {
+    background: #fffdf3; color: #164a30; border-radius: 28px; padding: 24px 22px;
+    max-width: 520px; width: 100%; box-shadow: 0 10px 40px rgba(0,0,0,.35); text-align: center;
+  }
+  .card h1 { margin: 0 0 4px; font-size: 30px; }
+  .card .lead { margin: 0 0 14px; font-size: 18px; }
+  .card ol { text-align: left; margin: 0 0 16px 4px; padding-left: 22px; font-size: 16px; line-height: 1.45; }
+  .card button {
+    display: block; width: 100%; border: 0; border-radius: 999px; padding: 16px 12px; margin-top: 10px;
+    font: inherit; font-size: 20px; font-weight: 700; cursor: pointer;
+    background: #ffcf33; color: #164a30; box-shadow: 0 5px 0 #c99a00;
+  }
+  .card button.secondary { background: #dff3e6; box-shadow: 0 5px 0 #a9cdb5; font-size: 16px; }
+  .card button:disabled { opacity: .55; cursor: default; }
+  #status { min-height: 1.4em; margin: 12px 0 0; font-size: 15px; color: #8a2b00; }
+  .fine { margin: 12px 0 0; font-size: 12.5px; color: #4d7a63; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+
+<div id="gate">
+  <div class="card">
+    <h1>🌴 Jungle Pop &amp; Move</h1>
+    <p class="lead">Learn letter sounds by moving!</p>
+    <ol>
+      <li>Cast or mirror this screen to your TV (landscape works best).</li>
+      <li>Prop the phone up so the front camera can see your child standing about 2 metres back.</li>
+      <li>Turn the volume up, then tap the button below.</li>
+    </ol>
+    <button id="btnGo">Turn on camera &amp; start</button>
+    <button id="btnTouch" class="secondary">Play without the camera (touch only)</button>
+    <p id="status" role="status"></p>
+    <p class="fine">Privacy: the camera picture stays on this device. Nothing is recorded, saved or uploaded.
+      (The body-tracking tool and its model are downloaded when you tap start, so you need to be online.)</p>
+  </div>
+</div>
+
+<script type="module">
+/* =====================================================================
+   JUNGLE POP & MOVE
+   A movement-based letter-sound game for a 5-year-old.
+
+   FILE MAP
+     1. CONFIG        – letters, sounds, difficulty. Tweak here first.
+     2. HELPERS       – maths, drawing helpers, jungle backdrop
+     3. SERVICES      – Speech, Sfx (sound effects), Cam, Pose, Input, FX
+     4. UI PARTS      – HoldButton, Guide (Kip the koala)
+     5. MODES         – PopTheSound  (add new modes here – see the template)
+     6. SCENES        – Start, Calibrate, Play, Celebrate
+     7. BOOT          – set-up screen, main loop
+
+   HOW TO ADD A MODE
+     class MyMode {
+       enter()      {}  // called once when the mode first starts
+       onResume()   {}  // called when we come back from a celebration screen
+       update(dt)   {}  // dt = seconds since last frame
+       draw()       {}  // draw with the global ctx
+       exit()       {}
+     }
+     - Award progress with:  Game.stars++   (8 stars = sticker celebration)
+     - Read the child's hands from Input.hands, and test with
+       Input.overEllipse(x, y, rx, ry, pad) or Input.overRect(rect, pad)
+     - Body landmarks (screen pixels) are in Input.scr[index] (MediaPipe pose index,
+       e.g. 11/12 shoulders, 23/24 hips, 0 nose).
+     - Speak with Speech.say([{t:'sss', rate:0.55}, {wait:200}, {t:'Well done!'}])
+     - Switch modes with Game.setMode(new MyMode()).
+   ===================================================================== */
+
+// =====================================================================
+// 1. CONFIG
+// =====================================================================
+const CONFIG = {
+  STARS_FOR_STICKER: 8,                 // correct answers per sticker
+  INITIAL_LETTERS: ['s', 'a', 't', 'i', 'p', 'n'],
+  LATER_LETTERS:   ['c', 'k', 'e', 'h', 'r', 'm', 'd', 'g', 'o', 'u', 'l', 'f', 'b'],
+  CORRECT_IN_ROW_FOR_NEW_LETTER: 4,     // 4 right in a row -> introduce a new letter
+  MISSES_IN_ROW_TO_SIMPLIFY: 3,         // 3 wrong in a row -> only 2 balloons
+  START_BALLOONS: 3, MAX_BALLOONS: 4, MIN_BALLOONS: 2,
+  HOLD_SECONDS: 2,                      // hold a hand on a button this long to press it
+  CALIBRATE_HOLD_SECONDS: 1.5,          // body must stay fully in view this long
+  SOUND_RATE: 0.55,                     // speaking speed for letter sounds (slow = clearer)
+  PROMPT_DELAY: 0.7,                    // seconds after balloons appear before the voice speaks
+  IDLE_HINT_SECONDS: 14,                // if nothing popped, repeat the sound and pulse the answer
+  MODEL_URL: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+  TASKS_VISION_VERSIONS: ['0.10.14', '0.10.18'],  // tried in order
+};
+
+/* What the voice says for each letter. Text-to-speech can't always say a bare sound well,
+   so each entry has the sound ("say") and a key word ("word"). The voice says e.g.
+   "sss ... as in sun". If a sound comes out wrong on your device, change the "say" spelling
+   here (try "ss", "sh-" style spellings) – or later swap in recorded audio clips. */
+const SOUNDS = {
+  s: { say: 'sss',  word: 'sun' },
+  a: { say: 'ah',   word: 'apple' },
+  t: { say: 'tuh',  word: 'tiger' },
+  i: { say: 'ih',   word: 'ink' },
+  p: { say: 'puh',  word: 'pig' },
+  n: { say: 'nnn',  word: 'nest' },
+  c: { say: 'kuh',  word: 'cat' },
+  k: { say: 'kuh',  word: 'kite' },
+  e: { say: 'eh',   word: 'egg' },
+  h: { say: 'huh',  word: 'hat' },
+  r: { say: 'rrr',  word: 'rabbit' },
+  m: { say: 'mmm',  word: 'monkey' },
+  d: { say: 'duh',  word: 'dog' },
+  g: { say: 'guh',  word: 'goat' },
+  o: { say: 'aw',   word: 'octopus' },
+  u: { say: 'uh',   word: 'umbrella' },
+  l: { say: 'lll',  word: 'lion' },
+  f: { say: 'fff',  word: 'fish' },
+  b: { say: 'buh',  word: 'ball' },
+};
+const sameSound = (a, b) => SOUNDS[a].say === SOUNDS[b].say;   // c and k share a sound
+
+const PRAISE = ['Yay!', 'Well done!', 'Great popping!', 'Brilliant!', 'You did it!', 'Awesome!'];
+const LEAD_INS = ['Can you find…', 'Pop the sound…', 'Where is…', 'Listen…'];
+const STICKERS = [
+  { e: '🦁', n: 'lion' }, { e: '🐘', n: 'elephant' }, { e: '🦒', n: 'giraffe' },
+  { e: '🐒', n: 'monkey' }, { e: '🦜', n: 'parrot' }, { e: '🐸', n: 'frog' },
+  { e: '🐢', n: 'turtle' }, { e: '🦓', n: 'zebra' }, { e: '🐊', n: 'crocodile' },
+  { e: '🦋', n: 'butterfly' },
+];
+// [base, light, dark] – bright but dark enough for white letters to pop
+const PALETTE = [
+  ['#e63946', '#ff8a94', '#8f1d27'], ['#1d6fe5', '#7fb2ff', '#0f3f8a'],
+  ['#f77f00', '#ffc069', '#9a4d00'], ['#7b2cbf', '#c18bf0', '#4a1778'],
+  ['#0a9d5b', '#6fe0a8', '#04593a'], ['#e83e8c', '#ff9cc8', '#93245a'],
+];
+const FONT_UI = '"Arial Rounded MT Bold","Baloo 2","Trebuchet MS","Segoe UI",system-ui,sans-serif';
+// Fonts with a single-storey "a" first; falls back to whatever the device has.
+const FONT_LETTER = '"Andika","Century Gothic","Comic Sans MS","Chalkboard SE","Trebuchet MS",sans-serif';
+const FONT_EMOJI = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+
+// =====================================================================
+// 2. HELPERS
+// =====================================================================
+const $ = (s) => document.querySelector(s);
+const canvas = $('#c');
+const ctx = canvas.getContext('2d');
+const video = $('#cam');
+let W = 0, H = 0, dpr = 1;
+
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const unit = () => Math.min(W, H) / 100;           // 1% of the short side – responsive sizing
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+const easeOutBack = (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+
+/** Rounded-rectangle path (works in every browser). */
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function fillEllipse(x, y, rx, ry, colour, rot = 0) {
+  ctx.fillStyle = colour; ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); ctx.fill();
+}
+/** Chunky outlined text – high contrast over any camera background. */
+function drawText(str, x, y, size, o = {}) {
+  const { fill = '#fff', stroke = '#0b3d2e', lw = 0.16, align = 'center', base = 'middle', font = FONT_UI, weight = '800' } = o;
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = base; ctx.lineJoin = 'round';
+  if (stroke) { ctx.lineWidth = size * lw; ctx.strokeStyle = stroke; ctx.strokeText(str, x, y); }
+  ctx.fillStyle = fill; ctx.fillText(str, x, y);
+}
+function starPath(x, y, r, rot = 0) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rad = i % 2 ? r * 0.45 : r;
+    const a = rot + (i * Math.PI) / 5 - Math.PI / 2;
+    if (i) ctx.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad); else ctx.moveTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad);
+  }
+  ctx.closePath();
+}
+
+// ---- Soft jungle overlay (drawn once to an offscreen canvas, re-built on resize) ----
+let jungle = null;
+function mulberry32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function leaf(c, x, y, len, angle, colour) {
+  c.save(); c.translate(x, y); c.rotate(angle);
+  c.fillStyle = colour; c.beginPath();
+  c.moveTo(0, 0); c.quadraticCurveTo(len * 0.5, -len * 0.38, len, 0); c.quadraticCurveTo(len * 0.5, len * 0.38, 0, 0); c.fill();
+  c.strokeStyle = 'rgba(255,255,255,.22)'; c.lineWidth = Math.max(1, len * 0.02);
+  c.beginPath(); c.moveTo(0, 0); c.lineTo(len * 0.92, 0); c.stroke();
+  c.restore();
+}
+function buildJungle() {
+  jungle = document.createElement('canvas');
+  jungle.width = Math.round(W * dpr); jungle.height = Math.round(H * dpr);
+  const c = jungle.getContext('2d'); c.scale(dpr, dpr);
+  const rnd = mulberry32(7);
+  const greens = ['#1f8a4c', '#2fae62', '#157a3f', '#3cc476', '#0f6a37'];
+  const u = Math.min(W, H) / 100;
+
+  c.fillStyle = 'rgba(40,160,80,0.14)'; c.fillRect(0, 0, W, H);                       // gentle green wash
+  const vg = c.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  vg.addColorStop(0, 'rgba(6,70,38,0)'); vg.addColorStop(1, 'rgba(6,70,38,0.5)');       // soft vignette
+  c.fillStyle = vg; c.fillRect(0, 0, W, H);
+
+  for (let x = -u * 4; x < W + u * 4; x += u * 7) {                                    // top canopy
+    leaf(c, x, -u * 2, u * rand2(rnd, 11, 20), Math.PI / 2 + (rnd() - 0.5) * 1.1, greens[Math.floor(rnd() * greens.length)]);
+  }
+  const vines = Math.max(4, Math.round(W / (u * 18)));                                 // hanging vines
+  for (let i = 0; i < vines; i++) {
+    const x = rnd() * W, len = H * (0.06 + rnd() * 0.12);
+    c.strokeStyle = '#1b5e20'; c.lineWidth = u * 0.6; c.beginPath(); c.moveTo(x, 0);
+    c.bezierCurveTo(x + u * 2, len * 0.3, x - u * 2, len * 0.6, x + u, len); c.stroke();
+    for (let k = 1; k <= 4; k++) leaf(c, x + (k % 2 ? 1 : -1) * u * 0.5, len * (k / 4.5), u * 4.5, (k % 2 ? 0.5 : Math.PI - 0.5) + 0.8, greens[k % greens.length]);
+  }
+  for (let x = -u * 3; x < W + u * 3; x += u * 6) {                                    // bottom bushes (kept low)
+    fillEllipse(x, H + u * 1.5, u * rand2(rnd, 5, 8), u * rand2(rnd, 4, 6.5), greens[Math.floor(rnd() * greens.length)]);
+    if (rnd() < 0.35) { c.fillStyle = pick2(rnd, ['#ff6fa5', '#ffd23f', '#ffffff']); c.beginPath(); c.arc(x + u * rand2(rnd, -2, 2), H - u * rand2(rnd, 1.5, 3.5), u * 0.9, 0, TAU); c.fill(); }
+  }
+}
+const rand2 = (r, a, b) => a + r() * (b - a);
+const pick2 = (r, arr) => arr[Math.floor(r() * arr.length)];
+
+function drawBackground() {
+  if (Cam.ready && video.readyState >= 2) {
+    const c = Cam.rect();
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);   // mirror, like a magic mirror
+    ctx.drawImage(video, c.dx, c.dy, c.dw, c.dh);
+    ctx.restore();
+  } else {                                               // no camera: a plain jungle gradient
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#bfeccb'); g.addColorStop(0.55, '#5cc98a'); g.addColorStop(1, '#1b7f4a');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  if (jungle) ctx.drawImage(jungle, 0, 0, W, H);
+}
+
+// =====================================================================
+// 3. SERVICES
+// =====================================================================
+
+// ---- Speech (browser text-to-speech, Australian English if available) ----
+const Speech = {
+  voice: null, enabled: true, speaking: false, token: 0,
+  init() {
+    if (!('speechSynthesis' in window)) return;
+    const choose = () => {
+      const vs = speechSynthesis.getVoices(); if (!vs.length) return;
+      const by = (l) => vs.filter((v) => v.lang.replace('_', '-').toLowerCase() === l).sort((a, b) => Number(b.localService) - Number(a.localService));
+      this.voice = by('en-au')[0] || by('en-nz')[0] || by('en-gb')[0] || vs.find((v) => v.lang.toLowerCase().startsWith('en')) || null;
+    };
+    choose(); speechSynthesis.onvoiceschanged = choose;
+  },
+  unlock() {                                   // some browsers only allow speech after a tap
+    try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } catch (e) { /* ignore */ }
+  },
+  /** parts: string, or array of {t:text, rate, pitch} / {wait:ms}. */
+  say(parts, onDone) {
+    if (typeof parts === 'string') parts = [{ t: parts }];
+    if (!this.enabled || !('speechSynthesis' in window)) { if (onDone) setTimeout(onDone, 400); return; }
+    const token = ++this.token;
+    try { speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    this.speaking = true;
+    let i = 0;
+    const next = () => {
+      if (token !== this.token) return;          // a newer message replaced this one
+      if (i >= parts.length) { this.speaking = false; if (onDone) onDone(); return; }
+      const p = parts[i++];
+      if (p.wait) { setTimeout(next, p.wait); return; }
+      const u = new SpeechSynthesisUtterance(p.t);
+      u.lang = this.voice ? this.voice.lang : 'en-AU';
+      if (this.voice) u.voice = this.voice;
+      u.rate = p.rate || 1; u.pitch = p.pitch || 1.1; u.volume = 1;
+      let done = false, tm = 0;
+      const fin = () => { if (done) return; done = true; clearTimeout(tm); next(); };
+      u.onend = fin; u.onerror = fin;
+      tm = setTimeout(fin, 1500 + (p.t.length * 180) / u.rate);   // safety net if a browser never fires onend
+      speechSynthesis.speak(u);
+    };
+    setTimeout(next, 60);                        // Chrome needs a tick between cancel() and speak()
+  },
+  cancel() { this.token++; this.speaking = false; try { speechSynthesis.cancel(); } catch (e) { /* ignore */ } },
+};
+
+// ---- Sound effects (generated with WebAudio – no files to download) ----
+const Sfx = {
+  ctx: null,
+  unlock() { try { this.ctx = this.ctx || new (window.AudioContext || window.webkitAudioContext)(); this.ctx.resume(); } catch (e) { /* ignore */ } },
+  tone(f0, f1, dur, type, vol, when = 0) {
+    const a = this.ctx; if (!a) return;
+    const t = a.currentTime + when;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(a.destination); o.start(t); o.stop(t + dur + 0.05);
+  },
+  pop() {
+    const a = this.ctx; if (!a) return;
+    const len = Math.floor(a.sampleRate * 0.18), buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const bp = a.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1400;
+    const g = a.createGain(); g.gain.value = 0.7;
+    src.connect(bp); bp.connect(g); g.connect(a.destination); src.start();
+    this.tone(700, 120, 0.12, 'sine', 0.35);
+  },
+  chime() { [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => this.tone(f, f, 0.35, 'triangle', 0.22, i * 0.09)); },
+  fanfare() { [523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5, 1318.5].forEach((f, i) => this.tone(f, f, 0.3, 'triangle', 0.25, i * 0.13)); },
+};
+
+// ---- Camera ----
+const Cam = {
+  ready: false,
+  async start() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('NO_MEDIA');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    if (!video.videoWidth) await new Promise((res) => { video.onloadedmetadata = res; setTimeout(res, 3000); });
+    this.ready = video.videoWidth > 0;
+  },
+  /** "Cover" fit of the video into the canvas (same maths for drawing and for mapping landmarks). */
+  rect() {
+    const vw = video.videoWidth || 16, vh = video.videoHeight || 9;
+    const s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s;
+    return { dx: (W - dw) / 2, dy: (H - dh) / 2, dw, dh };
+  },
+};
+
+// ---- Pose tracking (MediaPipe Tasks Vision, runs on this device) ----
+const Pose = {
+  landmarker: null, lastTs: 0,
+  async load() {
+    let lastErr = new Error('Could not load tracking');
+    for (const v of CONFIG.TASKS_VISION_VERSIONS) {
+      const base = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${v}`;
+      for (const entry of [`${base}/vision_bundle.mjs`, base]) {
+        try {
+          const mod = await import(entry);
+          const fileset = await mod.FilesetResolver.forVisionTasks(`${base}/wasm`);
+          for (const delegate of ['GPU', 'CPU']) {
+            try {
+              this.landmarker = await mod.PoseLandmarker.createFromOptions(fileset, {
+                baseOptions: { modelAssetPath: CONFIG.MODEL_URL, delegate },
+                runningMode: 'VIDEO', numPoses: 1,
+                minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+              });
+              return true;
+            } catch (e) { lastErr = e; }
+          }
+        } catch (e) { lastErr = e; }
+      }
+    }
+    throw lastErr;
+  },
+  detect(now) {
+    try { const ts = Math.max(now, this.lastTs + 1); this.lastTs = ts; return this.landmarker.detectForVideo(video, ts); }
+    catch (e) { return null; }
+  },
+};
+
+// ---- Input: turns body landmarks (or touch/mouse) into "hands" on the screen ----
+const HAND_SIDES = [{ w: 15, i: 19, t: 21 }, { w: 16, i: 20, t: 22 }];   // MediaPipe pose indices
+const Input = {
+  scr: null,            // body landmarks in screen pixels: [{x, y, v}] (mirrored to match the picture)
+  hands: [],            // [{x, y, pts:[{x,y}], pointer?}]
+  pointer: null, taps: [], lastVT: -1, lastSeen: -1e9, smooth: [null, null],
+  update(now) {
+    if (Pose.landmarker && Cam.ready && video.readyState >= 2 && video.currentTime !== this.lastVT) {
+      this.lastVT = video.currentTime;
+      const res = Pose.detect(now);
+      if (res && res.landmarks && res.landmarks[0]) {
+        const c = Cam.rect();
+        this.scr = res.landmarks[0].map((p) => ({ x: W - (c.dx + p.x * c.dw), y: c.dy + p.y * c.dh, v: p.visibility === undefined ? 1 : p.visibility }));
+        this.lastSeen = now;
+      }
+    }
+    if (now - this.lastSeen > 600) { this.scr = null; this.smooth = [null, null]; }
+
+    this.hands = [];
+    if (this.scr) {
+      HAND_SIDES.forEach((s, k) => {
+        const w = this.scr[s.w];
+        if (!w || w.v < 0.35) { this.smooth[k] = null; return; }
+        const pts = [w], ix = this.scr[s.i], th = this.scr[s.t];
+        if (ix && ix.v > 0.35) pts.push(ix);
+        if (th && th.v > 0.35) pts.push(th);
+        const cx = (w.x + (ix && ix.v > 0.35 ? ix.x : w.x)) / 2, cy = (w.y + (ix && ix.v > 0.35 ? ix.y : w.y)) / 2;
+        const sm = this.smooth[k];
+        const p = sm ? { x: sm.x + (cx - sm.x) * 0.65, y: sm.y + (cy - sm.y) * 0.65 } : { x: cx, y: cy };   // light smoothing
+        this.smooth[k] = p;
+        this.hands.push({ x: p.x, y: p.y, pts: [p, ...pts] });
+      });
+    }
+    if (this.pointer) this.hands.push({ x: this.pointer.x, y: this.pointer.y, pts: [this.pointer], pointer: true });
+  },
+  overRect(r, pad = 0) {
+    for (const h of this.hands) for (const p of h.pts) if (p.x >= r.x - pad && p.x <= r.x + r.w + pad && p.y >= r.y - pad && p.y <= r.y + r.h + pad) return true;
+    return false;
+  },
+  overEllipse(cx, cy, rx, ry, pad = 0) {
+    for (const h of this.hands) for (const p of h.pts) { const a = (p.x - cx) / (rx + pad), b = (p.y - cy) / (ry + pad); if (a * a + b * b <= 1) return true; }
+    return false;
+  },
+  consumeTap(r) {
+    for (let i = 0; i < this.taps.length; i++) { const t = this.taps[i]; if (t.x >= r.x && t.x <= r.x + r.w && t.y >= r.y && t.y <= r.y + r.h) { this.taps.splice(i, 1); return true; } }
+    return false;
+  },
+  endFrame() { this.taps.length = 0; },
+};
+// Touch / mouse also work as a "hand" (handy for testing and for grown-ups).
+canvas.addEventListener('pointerdown', (e) => { Input.pointer = { x: e.clientX, y: e.clientY }; Input.taps.push({ x: e.clientX, y: e.clientY }); });
+canvas.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse' || Input.pointer) Input.pointer = { x: e.clientX, y: e.clientY }; });
+['pointerup', 'pointercancel'].forEach((ev) => canvas.addEventListener(ev, (e) => { if (e.pointerType !== 'mouse') Input.pointer = null; }));
+canvas.addEventListener('pointerleave', () => { Input.pointer = null; });
+
+/** Is the child's whole body in view and a good size? Used by the "stand back" step. */
+function checkBody() {
+  const s = Input.scr;
+  if (!s) return { ok: false, code: 'none', msg: 'Step into the picture!' };
+  const mx = W * 0.02, my = H * 0.02;
+  for (const i of [0, 11, 12, 23, 24, 25, 26, 27, 28]) {          // nose, shoulders, hips, knees, ankles
+    const p = s[i];
+    if (!p || p.v < 0.4 || p.x < mx || p.x > W - mx || p.y < my || p.y > H - my) return { ok: false, code: 'back', msg: 'Step back so I can see all of you!' };
+  }
+  const span = Math.abs((s[27].y + s[28].y) / 2 - s[0].y);
+  if (span < H * 0.4) return { ok: false, code: 'close', msg: 'Come a little closer!' };
+  return { ok: true, code: 'ok', msg: 'Perfect! Hold still…' };
+}
+
+// ---- FX: sparkles and confetti ----
+const FX = {
+  list: [],
+  burst(x, y, colour, n = 30) {
+    const k = Math.max(1, Math.min(W, H) / 500);
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, TAU), sp = rand(150, 560);
+      this.list.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 140, g: 750, life: 0, max: rand(0.7, 1.3), size: rand(6, 14) * k,
+        colour: pick([colour, '#fff', '#ffd23f']), star: Math.random() < 0.5, rot: rand(0, TAU), vr: rand(-6, 6) });
+    }
+    if (this.list.length > 700) this.list.splice(0, this.list.length - 700);
+  },
+  confetti(n) {
+    const k = Math.max(1, Math.min(W, H) / 500);
+    for (let i = 0; i < n; i++) this.list.push({ x: rand(0, W), y: -20, vx: rand(-60, 60), vy: rand(150, 330), g: 40, life: 0, max: 6, size: rand(8, 15) * k,
+      colour: pick(['#ff4d6d', '#ffd23f', '#3a86ff', '#06d6a0', '#ff9f1c', '#c77dff']), star: Math.random() < 0.3, rot: rand(0, TAU), vr: rand(-8, 8) });
+  },
+  update(dt) {
+    for (const p of this.list) { p.life += dt; p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt; }
+    this.list = this.list.filter((p) => p.life < p.max && p.y < H + 40);
+  },
+  draw() {
+    for (const p of this.list) {
+      ctx.globalAlpha = clamp(1 - (p.life / p.max) * 0.9, 0, 1); ctx.fillStyle = p.colour;
+      if (p.star) { starPath(p.x, p.y, p.size, p.rot); ctx.fill(); }
+      else { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillRect(-p.size / 2, -p.size / 3, p.size, p.size * 0.66); ctx.restore(); }
+    }
+    ctx.globalAlpha = 1;
+  },
+};
+
+function drawCursors() {                       // glowing dots so the child can see where their hands are
+  const k = unit();
+  for (const h of Input.hands) {
+    const g = ctx.createRadialGradient(h.x, h.y, k * 0.5, h.x, h.y, k * 7);
+    g.addColorStop(0, 'rgba(255,240,120,.95)'); g.addColorStop(0.5, 'rgba(255,210,50,.5)'); g.addColorStop(1, 'rgba(255,210,50,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(h.x, h.y, k * 7, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = k * 0.7; ctx.beginPath(); ctx.arc(h.x, h.y, k * 2.6, 0, TAU); ctx.stroke();
+  }
+}
+
+// =====================================================================
+// 4. UI PARTS
+// =====================================================================
+
+/** A button pressed by holding a hand on it (or by tapping, for grown-ups). */
+class HoldButton {
+  constructor(o) {
+    Object.assign(this, { holdTime: CONFIG.HOLD_SECONDS, tapOnly: false, invisible: false, label: '', colour: '#ffcf33', fillColour: '#2ecc71',
+      textColour: '#134d31', onTrigger() {}, getRect: () => ({ x: 0, y: 0, w: 0, h: 0 }) }, o);
+    this.progress = 0; this.armed = true; this.cooldown = 0; this.t = 0;
+  }
+  update(dt) {
+    this.t += dt; if (this.cooldown > 0) this.cooldown -= dt;
+    const r = this.getRect();
+    if (Input.consumeTap(r) && this.cooldown <= 0) return this.fire();
+    const over = !this.tapOnly && Input.overRect(r, 0);
+    if (over && this.armed && this.cooldown <= 0) { this.progress += dt / this.holdTime; if (this.progress >= 1) this.fire(); }
+    else { this.progress = Math.max(0, this.progress - dt * 2); if (!over) this.armed = true; }
+  }
+  fire() { this.progress = 0; this.armed = false; this.cooldown = 0.6; this.onTrigger(); }
+  draw() {
+    if (this.invisible) return;
+    const r = this.getRect(), cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    const s = this.tapOnly ? 1 : 1 + 0.03 * Math.sin(this.t * 4);
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s); ctx.translate(-cx, -cy);
+    ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = r.h * 0.15; ctx.shadowOffsetY = r.h * 0.06;
+    ctx.fillStyle = this.colour; rr(r.x, r.y, r.w, r.h, r.h / 2); ctx.fill();
+    ctx.shadowColor = 'transparent';
+    if (this.progress > 0) { ctx.save(); rr(r.x, r.y, r.w, r.h, r.h / 2); ctx.clip(); ctx.fillStyle = this.fillColour; ctx.fillRect(r.x, r.y, r.w * this.progress, r.h); ctx.restore(); }
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(3, r.h * 0.06); rr(r.x, r.y, r.w, r.h, r.h / 2); ctx.stroke();
+    const lab = typeof this.label === 'function' ? this.label() : this.label;
+    drawText(lab, cx, cy + r.h * 0.02, r.h * (this.tapOnly ? 0.42 : 0.44), { fill: this.textColour, stroke: 'rgba(255,255,255,.85)', lw: 0.12 });
+    ctx.restore();
+  }
+}
+
+/** Draws Kip the koala. mood: 'idle' | 'wave' | 'happy'. */
+function drawKoala(x, y, r, mood, t) {
+  const happy = mood === 'happy';
+  const bob = Math.sin(t * (happy ? 9 : 2)) * r * (happy ? 0.07 : 0.025);
+  ctx.save(); ctx.translate(x, y + bob);
+  const grey = '#a9b4bb', dark = '#6b767d', belly = '#eef2f4';
+  fillEllipse(0, r * 1.4, r * 0.95, r * 0.85, grey);                       // body
+  fillEllipse(0, r * 1.5, r * 0.6, r * 0.6, belly);                        // tummy
+  const arm = (sx, ang) => { ctx.save(); ctx.translate(sx, r * 0.95); ctx.rotate(ang); fillEllipse(0, r * 0.42, r * 0.26, r * 0.52, grey); ctx.restore(); };
+  if (happy) { arm(-r * 0.85, 2.4 + Math.sin(t * 10) * 0.25); arm(r * 0.85, -2.4 - Math.sin(t * 10) * 0.25); }
+  else if (mood === 'wave') { arm(-r * 0.85, 0.25); arm(r * 0.85, -2.3 + Math.sin(t * 8) * 0.35); }
+  else { arm(-r * 0.85, 0.25 + Math.sin(t * 2) * 0.04); arm(r * 0.85, -0.25 - Math.sin(t * 2) * 0.04); }
+  fillEllipse(-r * 0.2, r * 2.1, r * 0.32, r * 0.2, dark); fillEllipse(r * 0.2, r * 2.1, r * 0.32, r * 0.2, dark);   // feet
+  for (const sx of [-1, 1]) { fillEllipse(sx * r * 0.98, -r * 0.5, r * 0.52, r * 0.52, grey); fillEllipse(sx * r * 0.98, -r * 0.5, r * 0.3, r * 0.3, '#f6b8c6'); }   // ears
+  fillEllipse(0, 0, r, r * 0.95, '#b9c3c9');                               // head
+  ctx.strokeStyle = dark; ctx.lineWidth = r * 0.04; ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.95, 0, 0, TAU); ctx.stroke();
+  const blink = !happy && (t % 3.6) > 3.45;                                // eyes
+  for (const sx of [-1, 1]) {
+    const ex = sx * r * 0.4, ey = -r * 0.08;
+    if (happy || blink) { ctx.strokeStyle = '#26323a'; ctx.lineWidth = r * 0.07; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(ex, ey + r * 0.04, r * 0.12, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); }
+    else { fillEllipse(ex, ey, r * 0.12, r * 0.14, '#26323a'); fillEllipse(ex + r * 0.04, ey - r * 0.05, r * 0.04, r * 0.04, '#fff'); }
+  }
+  fillEllipse(0, r * 0.2, r * 0.27, r * 0.35, '#2f3a40'); fillEllipse(-r * 0.08, r * 0.08, r * 0.07, r * 0.06, 'rgba(255,255,255,.55)');   // big koala nose
+  ctx.strokeStyle = '#2f3a40'; ctx.lineWidth = r * 0.05; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(0, r * 0.52, r * 0.2, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();   // smile
+  ctx.globalAlpha = 0.45; fillEllipse(-r * 0.68, r * 0.3, r * 0.15, r * 0.1, '#ff8fa3'); fillEllipse(r * 0.68, r * 0.3, r * 0.15, r * 0.1, '#ff8fa3'); ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/** Kip lives bottom-left during play and says each sound on request (hold a hand on Kip to hear it again). */
+const Guide = {
+  mood: 'idle', moodT: 0, t: 0,
+  update(dt) { this.t += dt; if (this.moodT > 0) { this.moodT -= dt; if (this.moodT <= 0) this.mood = 'idle'; } },
+  layout() { const r = clamp(Math.min(W, H) * 0.12, 36, 92), m = r * 0.25; return { r, x: r * 1.5 + m, y: H - r * 2.35 - m, m }; },
+  hotRect() { const L = this.layout(); return { x: L.x - L.r * 1.3, y: L.y - L.r * 1.4, w: L.r * 5.2, h: H - (L.y - L.r * 1.4) }; },
+  draw() {
+    const L = this.layout();
+    drawKoala(L.x, L.y, L.r, this.mood, this.t);
+    // speech bubble with a speaker icon (arcs pulse while the voice is talking)
+    const bx = L.x + L.r * 1.15, by = L.y - L.r * 1.25, bw = L.r * 2.4, bh = L.r * 1.15;
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#134d31'; ctx.lineWidth = L.r * 0.06;
+    rr(bx, by, bw, bh, bh / 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(bx + bh * 0.2, by + bh * 0.9); ctx.lineTo(bx - L.r * 0.15, by + bh * 1.25); ctx.lineTo(bx + bh * 0.6, by + bh * 0.95); ctx.closePath(); ctx.fill(); ctx.stroke();
+    const cx = bx + bw / 2, cy = by + bh / 2, s = bh * 0.3;
+    ctx.fillStyle = '#134d31'; ctx.fillRect(cx - s * 1.1, cy - s * 0.38, s * 0.55, s * 0.76);
+    ctx.beginPath(); ctx.moveTo(cx - s * 0.55, cy - s * 0.38); ctx.lineTo(cx + s * 0.25, cy - s * 0.95); ctx.lineTo(cx + s * 0.25, cy + s * 0.95); ctx.lineTo(cx - s * 0.55, cy + s * 0.38); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#134d31'; ctx.lineWidth = s * 0.22; ctx.lineCap = 'round';
+    for (let i = 1; i <= 2; i++) { ctx.globalAlpha = Speech.speaking ? 0.45 + 0.55 * Math.abs(Math.sin(this.t * 8 - i)) : 0.9; ctx.beginPath(); ctx.arc(cx + s * 0.3, cy, s * 0.55 * i, -0.8, 0.8); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  },
+};
+
+// =====================================================================
+// 5. MODES
+// =====================================================================
+
+class Balloon {
+  constructor(letter, slot, n, colours, delay) {
+    Object.assign(this, { letter, slot, n, colours, delay, t: 0, state: 'rising', alpha: 1, wobble: 0, phase: rand(0, TAU), dead: false, pulse: false, vy: 0, d: 0, curX: 0, init: false });
+    this.layout(0); this.y = H + this.d * 1.5; this.cy = this.y;
+  }
+  /** Size and position follow the screen: >= 18% of the screen width, and they fit side by side. */
+  layout(dt) {
+    let d = clamp(W / (this.n * 1.15), W * 0.18, W * 0.3);
+    d = Math.max(W * 0.18, Math.min(d, H * 0.5));
+    const tx = ((this.slot + 0.5) / this.n) * W;
+    if (!this.init) { this.d = d; this.curX = tx; this.init = true; }
+    else { const k = Math.min(1, dt * 6); this.d += (d - this.d) * k; this.curX += (tx - this.curX) * k; }
+    this.hoverY = H * 0.42;
+  }
+  get rx() { return this.d / 2; }
+  get ry() { return this.d * 0.6; }
+  get touchable() { return this.state === 'hover' || (this.state === 'rising' && this.t > this.delay && this.cy < H * 0.85); }
+  leave() { if (this.state !== 'leaving') { this.state = 'leaving'; this.vy = -H * 0.1; } }
+  update(dt) {
+    this.t += dt; this.layout(dt);
+    if (this.wobble > 0) this.wobble = Math.max(0, this.wobble - dt / 0.9);
+    if (this.state === 'rising') {
+      if (this.t >= this.delay) { const dist = this.y - this.hoverY; this.y -= clamp(dist * 1.6, 50, H * 0.6) * dt; if (dist < 2) this.state = 'hover'; }
+    } else if (this.state === 'hover') this.y = this.hoverY;
+    else if (this.state === 'leaving') { this.vy -= H * 1.2 * dt; this.y += this.vy * dt; this.alpha -= dt * 1.3; if (this.alpha <= 0 || this.y < -this.d) this.dead = true; }
+    const sway = Math.sin(this.t * 1.1 + this.phase) * this.d * 0.04;
+    const bob = this.state === 'hover' ? Math.sin(this.t * 1.6 + this.phase) * this.d * 0.05 : 0;
+    this.x = this.curX + sway; this.cy = this.y + bob;
+  }
+  draw() {
+    const d = this.d, rx = d / 2, ry = d * 0.6, [base, light, dark] = this.colours, w = this.wobble;
+    ctx.save(); ctx.globalAlpha = Math.max(0, this.alpha); ctx.translate(this.x, this.cy);
+    ctx.rotate(Math.sin(w * 28) * 0.22 * w);                               // gentle "no, not that one" wobble
+    const sc = 1 + (this.pulse ? 0.05 * Math.sin(this.t * 7) : 0) + w * 0.05 * Math.sin(w * 40);
+    ctx.scale(sc, sc);
+    ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = Math.max(2, d * 0.015); ctx.beginPath(); ctx.moveTo(0, ry + d * 0.08);   // string
+    for (let i = 1; i <= 6; i++) ctx.lineTo(Math.sin(i * 1.2 + this.t * 2 + this.phase) * d * 0.05, ry + d * 0.08 + i * d * 0.07);
+    ctx.stroke();
+    ctx.fillStyle = dark; ctx.beginPath(); ctx.moveTo(0, ry - d * 0.01); ctx.lineTo(-d * 0.07, ry + d * 0.09); ctx.lineTo(d * 0.07, ry + d * 0.09); ctx.closePath(); ctx.fill();   // knot
+    const g = ctx.createRadialGradient(-rx * 0.35, -ry * 0.4, d * 0.05, 0, 0, ry * 1.1); g.addColorStop(0, light); g.addColorStop(1, base);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.lineWidth = d * 0.03; ctx.strokeStyle = 'rgba(255,255,255,.92)'; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.ellipse(-rx * 0.45, -ry * 0.5, rx * 0.16, ry * 0.26, -0.5, 0, TAU); ctx.fill();   // shine
+    drawText(this.letter, 0, d * 0.03, d * 0.72, { font: FONT_LETTER, fill: '#fff', stroke: dark, lw: 0.14, weight: '700' });
+    ctx.restore();
+  }
+}
+
+/** MODE 1 – "Pop the Sound": the voice says a letter sound, the child pops the matching balloon. */
+class PopTheSound {
+  enter() {
+    this.pool = [...CONFIG.INITIAL_LETTERS]; this.later = [...CONFIG.LATER_LETTERS]; this.fresh = [];
+    this.baseBalloons = CONFIG.START_BALLOONS; this.balloonCount = this.baseBalloons; this.reduced = false;
+    this.streak = 0; this.missStreak = 0; this.pendingNew = null; this.lastTarget = null; this.rounds = 0; this.replayCooldown = 0;
+    this.nextRound();
+  }
+  onResume() { this.nextRound(); }
+  exit() { Speech.cancel(); }
+
+  pickTarget() {
+    const bag = [], boost = this.fresh.slice(-2);          // newly learned letters appear more often
+    for (const l of this.pool) { if (l === this.lastTarget && this.pool.length > 1) continue; for (let i = 0; i < (boost.includes(l) ? 3 : 1); i++) bag.push(l); }
+    return pick(bag);
+  }
+  nextRound() {
+    this.state = 'asking'; this.t = 0; this.idle = 0; this.missCooldown = 0; this.prompted = false; this.reveal = null;
+    let target, isNew = false;
+    if (this.pendingNew) { target = this.pendingNew; this.pendingNew = null; isNew = true; } else target = this.pickTarget();
+    this.target = target; this.isNew = isNew; this.lastTarget = target;
+    const others = shuffle(this.pool.filter((l) => l !== target && !sameSound(l, target))).slice(0, this.balloonCount - 1);
+    const letters = shuffle([target, ...others]), cols = shuffle(PALETTE);
+    this.balloons = letters.map((l, i) => new Balloon(l, i, letters.length, cols[i % cols.length], i * 0.18));
+    this.rounds++;
+  }
+
+  soundParts() { const s = SOUNDS[this.target]; return [{ t: s.say, rate: CONFIG.SOUND_RATE }, { wait: 120 }, { t: 'as in ' + s.word, rate: 0.9 }]; }
+  promptParts() {
+    const lead = this.rounds <= 1 ? 'Pop the balloon that makes the sound.' : this.isNew ? 'Here is a new sound!' : pick(LEAD_INS);
+    return [{ t: lead, rate: 0.95 }, { wait: 100 }, ...this.soundParts()];
+  }
+  /** Called when a hand rests on Kip. */
+  replay() { if (this.state === 'asking' && this.replayCooldown <= 0) { this.replayCooldown = 3; Speech.say(this.soundParts()); } }
+  hintTarget() { Speech.say(this.soundParts()); for (const b of this.balloons) b.pulse = b.letter === this.target; }
+
+  update(dt) {
+    this.t += dt; this.missCooldown = Math.max(0, this.missCooldown - dt); this.replayCooldown = Math.max(0, this.replayCooldown - dt);
+    for (const b of this.balloons) b.update(dt);
+    this.balloons = this.balloons.filter((b) => !b.dead);
+    if (this.reveal) this.reveal.t += dt;
+
+    if (this.state === 'asking') {
+      if (!this.prompted && this.t > CONFIG.PROMPT_DELAY) { this.prompted = true; Speech.say(this.promptParts()); }
+      this.idle += dt;
+      if (this.idle > CONFIG.IDLE_HINT_SECONDS) { this.idle = 0; this.hintTarget(); }
+      if (this.t > 1.1) {                                     // balloons need a moment before they can be popped
+        for (const b of this.balloons) {
+          if (b.touchable && Input.overEllipse(b.x, b.cy, b.rx, b.ry, unit() * 3)) { this.touch(b); break; }
+        }
+      }
+    } else if (this.state === 'cheering') {
+      this.cheerT += dt;
+      if (this.cheerT > 2.3) {
+        this.state = 'waiting';
+        if (Game.stars >= CONFIG.STARS_FOR_STICKER) Game.go('celebrate'); else this.nextRound();
+      }
+    }
+  }
+
+  touch(b) {
+    if (b.letter === this.target) return this.correct(b);
+    // Wrong balloon: it just wobbles. No buzzers, nothing is taken away.
+    if (b.wobble < 0.4) b.wobble = 1;
+    if (this.missCooldown > 0) return;                        // flailing arms count as one miss, not many
+    this.missCooldown = 1.8; this.streak = 0; this.missStreak++;
+    Speech.say([{ t: 'Have another go!', rate: 0.95 }, { wait: 100 }, ...this.soundParts()]);
+    if (this.missStreak >= CONFIG.MISSES_IN_ROW_TO_SIMPLIFY) this.simplify();
+  }
+  /** 3 misses in a row -> fewer balloons (also trims the current round right away). */
+  simplify() {
+    this.missStreak = 0;
+    if (this.balloonCount <= CONFIG.MIN_BALLOONS) return;
+    this.balloonCount = CONFIG.MIN_BALLOONS; this.reduced = true;
+    const live = this.balloons.filter((b) => b.state !== 'leaving');
+    const keepT = live.find((b) => b.letter === this.target), keepO = live.find((b) => b.letter !== this.target);
+    for (const b of live) if (b !== keepT && b !== keepO) b.leave();
+    shuffle([keepT, keepO].filter(Boolean)).forEach((b, i, arr) => { b.slot = i; b.n = arr.length; });
+  }
+  correct(b) {
+    this.state = 'cheering'; this.cheerT = 0;
+    b.dead = true; FX.burst(b.x, b.cy, b.colours[0], 36); Sfx.pop(); setTimeout(() => Sfx.chime(), 90);
+    for (const o of this.balloons) if (o !== b) o.leave();
+    this.reveal = { letter: b.letter, t: 0, colours: b.colours };
+    this.streak++; this.missStreak = 0; Game.stars++;
+    if (this.reduced && this.streak >= 3) { this.balloonCount = this.baseBalloons; this.reduced = false; }
+    if (this.streak >= CONFIG.CORRECT_IN_ROW_FOR_NEW_LETTER && this.later.length) {   // 4 in a row -> new letter next round
+      const nl = this.later.shift(); this.pool.push(nl); this.fresh.push(nl); this.pendingNew = nl; this.streak = 0;
+      this.baseBalloons = Math.min(CONFIG.MAX_BALLOONS, this.baseBalloons + 1);
+      if (!this.reduced) this.balloonCount = this.baseBalloons;
+    }
+    Speech.say([{ t: SOUNDS[b.letter].say, rate: CONFIG.SOUND_RATE }, { wait: 150 }, { t: pick(PRAISE) }]);   // the sound repeats
+    Guide.mood = 'happy'; Guide.moodT = 2.2;
+  }
+
+  draw() {
+    for (const b of this.balloons) b.draw();
+    if (this.reveal) {                                        // big letter after a correct pop
+      const t = this.reveal.t, s = easeOutBack(Math.min(1, t / 0.4)), size = Math.min(W * 0.45, H * 0.34);
+      ctx.save(); ctx.globalAlpha = clamp((2.2 - t) / 0.4, 0, 1); ctx.translate(W / 2, H * 0.4); ctx.scale(s, s);
+      const g = ctx.createRadialGradient(0, 0, size * 0.1, 0, 0, size * 0.8); g.addColorStop(0, 'rgba(255,255,255,.9)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, size * 0.8, 0, TAU); ctx.fill();
+      drawText(this.reveal.letter, 0, size * 0.04, size, { font: FONT_LETTER, fill: '#fff', stroke: this.reveal.colours[2], lw: 0.12, weight: '700' });
+      ctx.restore();
+    }
+    if (this.isNew && this.state === 'asking') {              // "New sound!" tag
+      const w = Math.min(W * 0.6, 360), h = unit() * 7, x = (W - w) / 2, y = unit() * 15;
+      ctx.fillStyle = '#ffcf33'; rr(x, y, w, h, h / 2); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = unit() * 0.5; ctx.stroke();
+      drawText('New sound!', W / 2, y + h / 2, h * 0.55, { fill: '#134d31', stroke: '#fff', lw: 0.1 });
+    }
+  }
+}
+
+// =====================================================================
+// 6. SCENES
+// =====================================================================
+const Game = {
+  scenes: {}, scene: null, sceneName: '', mode: null, modeStarted: false, stars: 0, stickers: [],
+  setMode(m) { this.mode = m; this.modeStarted = false; },
+  go(name) { if (this.scene && this.scene.exit) this.scene.exit(); this.sceneName = name; this.scene = this.scenes[name]; this.scene.enter(); },
+};
+
+function drawStarHUD() {
+  const n = CONFIG.STARS_FOR_STICKER, sz = clamp(Math.min(W, H) * 0.05, 24, 48), gap = sz * 0.35, pad = sz * 0.5;
+  const w = n * sz + (n - 1) * gap + pad * 2, h = sz + pad * 1.2, x = (W - w) / 2, y = unit() * 2.5;
+  ctx.fillStyle = 'rgba(11,61,46,.6)'; rr(x, y, w, h, h / 2); ctx.fill();
+  for (let i = 0; i < n; i++) {
+    const cx = x + pad + sz / 2 + i * (sz + gap), cy = y + h / 2;
+    starPath(cx, cy, sz * 0.55); ctx.fillStyle = i < Game.stars ? '#ffd23f' : 'rgba(255,255,255,.25)'; ctx.fill();
+    ctx.strokeStyle = i < Game.stars ? '#fff' : 'rgba(255,255,255,.5)'; ctx.lineWidth = sz * 0.06; ctx.stroke();
+  }
+}
+
+class StartScene {
+  enter() {
+    this.t = 0; Guide.mood = 'wave'; Guide.moodT = 1e9; this.greeted = false;
+    this.play = new HoldButton({
+      label: 'PLAY', getRect: () => { const w = Math.min(W * 0.7, 560), h = Math.min(H * 0.17, 150); return { x: (W - w) / 2, y: H * 0.66, w, h }; },
+      onTrigger: () => { Sfx.chime(); Guide.mood = 'idle'; Game.go(Pose.landmarker ? 'calibrate' : 'play'); },
+    });
+    this.voice = new HoldButton({
+      tapOnly: true, colour: '#dff3e6', label: () => (Speech.enabled ? 'Voice: ON' : 'Voice: OFF'),
+      getRect: () => { const w = clamp(W * 0.28, 120, 190), h = 40; return { x: W - w - 12, y: 12, w, h }; },
+      onTrigger: () => { Speech.enabled = !Speech.enabled; if (!Speech.enabled) Speech.cancel(); },
+    });
+  }
+  update(dt) {
+    this.t += dt; Guide.update(dt);
+    if (!this.greeted && this.t > 0.6) { this.greeted = true; Speech.say([{ t: "Hi! I'm Kip the koala." }, { wait: 150 }, { t: 'Hold your hand on the play button to start!' }]); }
+    this.play.update(dt); this.voice.update(dt);
+  }
+  draw() {
+    ctx.fillStyle = 'rgba(8,70,40,.35)'; ctx.fillRect(0, 0, W, H);
+    drawText('Jungle Pop & Move', W / 2, H * 0.1, Math.min(W * 0.08, H * 0.075), { fill: '#ffe066', stroke: '#0b3d2e' });
+    drawKoala(W / 2, H * 0.34, Math.min(W * 0.17, H * 0.12), 'wave', this.t);
+    this.play.draw(); this.voice.draw();
+    const r = this.play.getRect();
+    drawText(Pose.landmarker ? 'Hold your hand on the button!' : 'Tap the button to play!', W / 2, r.y + r.h + Math.min(W, H) * 0.06, Math.min(W * 0.045, H * 0.035));
+    if (!Pose.landmarker) drawText('Touch mode – body tracking is off', W / 2, H - unit() * 3, Math.min(W * 0.03, H * 0.025), { fill: '#fff', lw: 0.2 });
+  }
+}
+
+class CalibrateScene {
+  enter() {
+    this.hold = 0; this.lastCode = ''; this.lastSpoken = -99; this.t = 0; this.status = checkBody();
+    this.skip = new HoldButton({
+      tapOnly: true, colour: '#dff3e6', label: 'Skip (grown-up)',
+      getRect: () => { const w = clamp(W * 0.34, 130, 220), h = 40; return { x: W - w - 12, y: H - h - 12, w, h }; },
+      onTrigger: () => Game.go('play'),
+    });
+  }
+  update(dt) {
+    this.t += dt; this.status = checkBody();
+    if (this.status.ok) this.hold += dt; else this.hold = Math.max(0, this.hold - dt * 2);
+    if (this.status.code !== this.lastCode && this.t - this.lastSpoken > 4) {      // speak only when the advice changes
+      this.lastCode = this.status.code; this.lastSpoken = this.t;
+      Speech.say(this.t < 1 ? "Let's get ready! Step back so I can see all of you." : this.status.msg);
+    }
+    if (this.hold >= CONFIG.CALIBRATE_HOLD_SECONDS) { Sfx.chime(); Game.go('play'); return; }
+    this.skip.update(dt);
+  }
+  draw() {
+    const ok = this.status.ok, cx = W / 2;
+    ctx.fillStyle = 'rgba(8,70,40,.25)'; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.setLineDash([16, 12]); ctx.lineWidth = unit() * 0.8; ctx.lineCap = 'round';
+    ctx.strokeStyle = ok ? '#5dff9b' : 'rgba(255,255,255,.85)';
+    ctx.beginPath(); ctx.arc(cx, H * 0.17, H * 0.055, 0, TAU); ctx.stroke();                                   // head
+    rr(cx - H * 0.11, H * 0.24, H * 0.22, H * 0.28, H * 0.05); ctx.stroke();                                   // body
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.moveTo(cx + s * H * 0.11, H * 0.27); ctx.lineTo(cx + s * H * 0.22, H * 0.46); ctx.stroke();   // arms
+      rr(cx + (s < 0 ? -H * 0.105 : H * 0.005), H * 0.53, H * 0.1, H * 0.37, H * 0.04); ctx.stroke();        // legs
+    }
+    ctx.restore();
+    drawText(this.status.msg, cx, H * 0.06, Math.min(W * 0.07, H * 0.045), { fill: ok ? '#b6ffd1' : '#fff' });
+    const bw = Math.min(W * 0.6, 420), bh = unit() * 2.4, bx = cx - bw / 2, by = H * 0.94 - bh;               // hold-still progress bar
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; rr(bx, by, bw, bh, bh / 2); ctx.fill();
+    if (this.hold > 0) { ctx.fillStyle = '#2ecc71'; rr(bx, by, Math.max(bh, (bw * this.hold) / CONFIG.CALIBRATE_HOLD_SECONDS), bh, bh / 2); ctx.fill(); }
+    this.skip.draw();
+  }
+}
+
+class PlayScene {
+  enter() {
+    this.noBody = 0;
+    if (!this.replayBtn) this.replayBtn = new HoldButton({ invisible: true, holdTime: 0.7, getRect: () => Guide.hotRect(), onTrigger: () => { if (Game.mode.replay) Game.mode.replay(); } });
+    Guide.mood = 'idle'; Guide.moodT = 0;
+    if (!Game.modeStarted) { Game.modeStarted = true; Game.mode.enter(); } else if (Game.mode.onResume) Game.mode.onResume();
+  }
+  update(dt) {
+    Guide.update(dt); this.replayBtn.update(dt); Game.mode.update(dt);
+    this.noBody = Pose.landmarker && !Input.scr ? this.noBody + dt : 0;
+  }
+  draw() {
+    Game.mode.draw(); Guide.draw(); drawStarHUD();
+    if (this.noBody > 4) drawText('Step back into the picture!', W / 2, H * 0.14, Math.min(W * 0.055, H * 0.04), { fill: '#fff6b0' });
+  }
+}
+
+class CelebrateScene {
+  enter() {
+    this.t = 0; this.finished = false;
+    this.sticker = STICKERS[Game.stickers.length % STICKERS.length]; Game.stickers.push(this.sticker); Game.stars = 0;
+    Guide.mood = 'happy'; Guide.moodT = 1e9; Sfx.fanfare();
+    Speech.say([{ t: 'Wow! Great popping!' }, { wait: 150 }, { t: `You earned a ${this.sticker.n} sticker!` }]);
+    this.btn = new HoldButton({
+      label: 'Keep playing', getRect: () => { const w = Math.min(W * 0.7, 520), h = Math.min(H * 0.14, 120); return { x: (W - w) / 2, y: H * 0.8, w, h }; },
+      onTrigger: () => this.finish(),
+    });
+  }
+  finish() { if (this.finished) return; this.finished = true; Guide.moodT = 0; Guide.mood = 'idle'; Game.go('play'); }
+  update(dt) {
+    this.t += dt; Guide.update(dt); if (this.t < 5) FX.confetti(2);
+    if (this.t > 1.2) this.btn.update(dt);                  // ignore hands for a moment so it isn't pressed by accident
+    if (this.t > 25) this.finish();
+  }
+  draw() {
+    ctx.fillStyle = 'rgba(0,40,20,.55)'; ctx.fillRect(0, 0, W, H);
+    drawText('Sticker earned!', W / 2, H * 0.1, Math.min(W * 0.09, H * 0.07), { fill: '#ffe066' });
+    const size = Math.min(W * 0.55, H * 0.34), s = easeOutBack(Math.min(1, this.t / 0.6)), cy = H * 0.36;
+    ctx.save(); ctx.translate(W / 2, cy); ctx.rotate(Math.sin(this.t * 2) * 0.05); ctx.scale(s, s);
+    ctx.shadowColor = 'rgba(0,0,0,.4)'; ctx.shadowBlur = size * 0.08; ctx.shadowOffsetY = size * 0.04;
+    ctx.fillStyle = '#fff'; rr(-size / 2, -size / 2, size, size, size * 0.2); ctx.fill(); ctx.shadowColor = 'transparent';
+    ctx.lineWidth = size * 0.045; ctx.strokeStyle = '#ffcf33'; ctx.stroke();
+    ctx.font = `${size * 0.62}px ${FONT_EMOJI}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#000'; ctx.fillText(this.sticker.e, 0, size * 0.04);
+    ctx.restore();
+    const n = Game.stickers.length, ss = clamp(Math.min(W / (n + 1), H * 0.07), 22, 56);      // sticker collection row
+    ctx.font = `${ss}px ${FONT_EMOJI}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#000';
+    Game.stickers.forEach((st, i) => ctx.fillText(st.e, W / 2 + (i - (n - 1) / 2) * ss * 1.2, H * 0.67));
+    if (this.t > 1.2) this.btn.draw();
+    const L = Guide.layout(); drawKoala(L.x, L.y, L.r, 'happy', Guide.t);
+  }
+}
+
+// =====================================================================
+// 7. BOOT
+// =====================================================================
+const gate = $('#gate'), btnGo = $('#btnGo'), btnTouch = $('#btnTouch'), statusEl = $('#status');
+const setStatus = (m) => { statusEl.textContent = m; };
+
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  buildJungle();
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 250));
+
+async function keepAwake() { try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) { /* ignore */ } }
+let started = false;
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { if (started) keepAwake(); } else Speech.cancel(); });
+
+function cameraHelp(e) {
+  if (!window.isSecureContext) return 'The camera only works on a secure (https) page. Host this file (for example Netlify Drop or GitHub Pages) and open that link.';
+  if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) return 'The camera was blocked. Allow camera access in your browser settings, then try again.';
+  if (e && e.name === 'NotFoundError') return 'No camera was found on this device.';
+  return 'Could not start the camera. You can still play in touch-only mode.';
+}
+
+async function begin(useCamera) {
+  Sfx.unlock(); Speech.init(); Speech.unlock(); keepAwake();
+  btnGo.disabled = btnTouch.disabled = true;
+  if (useCamera) {
+    try { setStatus('Starting the camera…'); await Cam.start(); }
+    catch (e) { console.warn(e); setStatus(cameraHelp(e)); btnGo.disabled = btnTouch.disabled = false; return; }
+    try { setStatus('Loading body tracking… (needs internet, can take a few seconds)'); await Pose.load(); }
+    catch (e) { console.warn(e); setStatus('Body tracking could not load, so we will start in touch-only mode.'); await new Promise((r) => setTimeout(r, 1800)); }
+  }
+  gate.style.display = 'none'; started = true;
+  resize();
+  Game.scenes = { start: new StartScene(), calibrate: new CalibrateScene(), play: new PlayScene(), celebrate: new CelebrateScene() };
+  Game.setMode(new PopTheSound());      // <- swap or add modes here
+  Game.go('start');
+  let last = performance.now();
+  const frame = (now) => {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.05, (now - last) / 1000 || 0.016); last = now;
+    Input.update(now);
+    Game.scene.update(dt);
+    drawBackground();
+    Game.scene.draw();
+    FX.update(dt); FX.draw();
+    drawCursors();
+    Input.endFrame();
+  };
+  requestAnimationFrame(frame);
+}
+btnGo.addEventListener('click', () => begin(true));
+btnTouch.addEventListener('click', () => begin(false));
+resize();
+</script>
+</body>
+</html>
